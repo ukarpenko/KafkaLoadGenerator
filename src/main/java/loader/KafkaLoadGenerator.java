@@ -26,6 +26,13 @@ import java.util.stream.Collectors;
 
 public class KafkaLoadGenerator {
 
+    private static final String SECURITY_PROTOCOL_PLAINTEXT = "PLAINTEXT";
+    private static final String SECURITY_PROTOCOL_SSL = "SSL";
+
+    private static final String CRED_TRUSTSTORE_PASSWORD = "truststore_password";
+    private static final String CRED_KEYSTORE_PASSWORD = "keystore_password";
+    private static final String CRED_KEY_PASSWORD = "key_password";
+
     public static void main(String[] args) throws Exception {
         if (args.length != 1) {
             System.out.println("Usage: java loader.KafkaLoadGenerator <config.properties>");
@@ -45,6 +52,11 @@ public class KafkaLoadGenerator {
         AppConfig appConfig = AppConfig.fromProperties(properties);
         appConfig.validate();
 
+        SslCredentials sslCredentials = null;
+        if (appConfig.isSsl()) {
+            sslCredentials = SslCredentials.loadFromCredentialsDirectory();
+        }
+
         List<String> lines = Files.readAllLines(Path.of(appConfig.filePath), StandardCharsets.UTF_8)
                 .stream()
                 .map(String::trim)
@@ -55,7 +67,7 @@ public class KafkaLoadGenerator {
             throw new IllegalArgumentException("Input file is empty: " + appConfig.filePath);
         }
 
-        Properties kafkaProps = buildKafkaProperties(appConfig);
+        Properties kafkaProps = buildKafkaProperties(appConfig, sslCredentials);
         KafkaProducer<String, String> producer = new KafkaProducer<>(kafkaProps);
 
         int totalThreads = appConfig.topics.size() * appConfig.threadsPerTopic;
@@ -181,7 +193,7 @@ public class KafkaLoadGenerator {
         }
     }
 
-    private static Properties buildKafkaProperties(AppConfig appConfig) {
+    private static Properties buildKafkaProperties(AppConfig appConfig, SslCredentials sslCredentials) {
         Properties props = new Properties();
 
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, appConfig.bootstrapServers);
@@ -196,12 +208,16 @@ public class KafkaLoadGenerator {
 
         props.put("security.protocol", appConfig.securityProtocol);
 
-        if ("SSL".equalsIgnoreCase(appConfig.securityProtocol)) {
+        if (appConfig.isSsl()) {
+            if (sslCredentials == null) {
+                throw new IllegalStateException("SSL credentials were not loaded");
+            }
+
             props.put("ssl.truststore.location", appConfig.truststoreLocation);
-            props.put("ssl.truststore.password", appConfig.truststorePassword);
+            props.put("ssl.truststore.password", sslCredentials.truststorePassword);
             props.put("ssl.keystore.location", appConfig.keystoreLocation);
-            props.put("ssl.keystore.password", appConfig.keystorePassword);
-            props.put("ssl.key.password", appConfig.keyPassword);
+            props.put("ssl.keystore.password", sslCredentials.keystorePassword);
+            props.put("ssl.key.password", sslCredentials.keyPassword);
         }
 
         return props;
@@ -233,10 +249,7 @@ public class KafkaLoadGenerator {
         String securityProtocol;
 
         String truststoreLocation;
-        String truststorePassword;
         String keystoreLocation;
-        String keystorePassword;
-        String keyPassword;
 
         String acks;
         int lingerMs;
@@ -259,13 +272,10 @@ public class KafkaLoadGenerator {
             c.epsPerTopic = Integer.parseInt(required(p, "eps.per.topic"));
             c.compressionType = p.getProperty("compression.type", "none").trim();
 
-            c.securityProtocol = p.getProperty("security.protocol", "PLAINTEXT").trim();
+            c.securityProtocol = p.getProperty("security.protocol", SECURITY_PROTOCOL_PLAINTEXT).trim();
 
             c.truststoreLocation = p.getProperty("ssl.truststore.location");
-            c.truststorePassword = p.getProperty("ssl.truststore.password");
             c.keystoreLocation = p.getProperty("ssl.keystore.location");
-            c.keystorePassword = p.getProperty("ssl.keystore.password");
-            c.keyPassword = p.getProperty("ssl.key.password", c.keystorePassword);
 
             c.acks = p.getProperty("acks", "1").trim();
             c.lingerMs = Integer.parseInt(p.getProperty("linger.ms", "1").trim());
@@ -273,6 +283,10 @@ public class KafkaLoadGenerator {
             c.bufferMemory = Long.parseLong(p.getProperty("buffer.memory", "67108864").trim());
 
             return c;
+        }
+
+        boolean isSsl() {
+            return SECURITY_PROTOCOL_SSL.equalsIgnoreCase(securityProtocol);
         }
 
         void validate() {
@@ -292,19 +306,16 @@ public class KafkaLoadGenerator {
                 throw new IllegalArgumentException("Input file does not exist: " + filePath);
             }
 
-            if (!"PLAINTEXT".equalsIgnoreCase(securityProtocol) &&
-                !"SSL".equalsIgnoreCase(securityProtocol)) {
+            if (!SECURITY_PROTOCOL_PLAINTEXT.equalsIgnoreCase(securityProtocol) &&
+                !SECURITY_PROTOCOL_SSL.equalsIgnoreCase(securityProtocol)) {
                 throw new IllegalArgumentException("security.protocol must be PLAINTEXT or SSL");
             }
 
             validateCompressionType(compressionType);
 
-            if ("SSL".equalsIgnoreCase(securityProtocol)) {
+            if (isSsl()) {
                 requireNonBlank(truststoreLocation, "ssl.truststore.location");
-                requireNonBlank(truststorePassword, "ssl.truststore.password");
                 requireNonBlank(keystoreLocation, "ssl.keystore.location");
-                requireNonBlank(keystorePassword, "ssl.keystore.password");
-                requireNonBlank(keyPassword, "ssl.key.password");
 
                 if (!Files.exists(Path.of(truststoreLocation))) {
                     throw new IllegalArgumentException("Truststore does not exist: " + truststoreLocation);
@@ -337,6 +348,68 @@ public class KafkaLoadGenerator {
             if (value == null || value.trim().isEmpty()) {
                 throw new IllegalArgumentException("Missing required property: " + key);
             }
+        }
+    }
+
+    static class SslCredentials {
+        final String truststorePassword;
+        final String keystorePassword;
+        final String keyPassword;
+
+        SslCredentials(String truststorePassword, String keystorePassword, String keyPassword) {
+            this.truststorePassword = truststorePassword;
+            this.keystorePassword = keystorePassword;
+            this.keyPassword = keyPassword;
+        }
+
+        static SslCredentials loadFromCredentialsDirectory() throws Exception {
+            String credentialsDirectory = System.getenv("CREDENTIALS_DIRECTORY");
+
+            if (credentialsDirectory == null || credentialsDirectory.trim().isEmpty()) {
+                throw new IllegalArgumentException(
+                        "security.protocol=SSL, but CREDENTIALS_DIRECTORY is not set. " +
+                        "Make sure the service is started by systemd with LoadCredential= configured."
+                );
+            }
+
+            Path credentialsDirPath = Path.of(credentialsDirectory);
+            if (!Files.exists(credentialsDirPath) || !Files.isDirectory(credentialsDirPath)) {
+                throw new IllegalArgumentException(
+                        "security.protocol=SSL, but CREDENTIALS_DIRECTORY does not exist or is not a directory: " +
+                        credentialsDirectory
+                );
+            }
+
+            String truststorePassword = readRequiredCredential(credentialsDirPath, CRED_TRUSTSTORE_PASSWORD);
+            String keystorePassword = readRequiredCredential(credentialsDirPath, CRED_KEYSTORE_PASSWORD);
+            String keyPassword = readRequiredCredential(credentialsDirPath, CRED_KEY_PASSWORD);
+
+            return new SslCredentials(truststorePassword, keystorePassword, keyPassword);
+        }
+
+        private static String readRequiredCredential(Path credentialsDir, String fileName) throws Exception {
+            Path credentialFile = credentialsDir.resolve(fileName);
+
+            if (!Files.exists(credentialFile)) {
+                throw new IllegalArgumentException(
+                        "Missing required SSL credential file: " + credentialFile
+                );
+            }
+
+            if (!Files.isRegularFile(credentialFile)) {
+                throw new IllegalArgumentException(
+                        "SSL credential path is not a regular file: " + credentialFile
+                );
+            }
+
+            String value = Files.readString(credentialFile, StandardCharsets.UTF_8).trim();
+            if (value.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "SSL credential file is empty: " + credentialFile
+                );
+            }
+
+            return value;
         }
     }
 }
